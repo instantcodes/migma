@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Play &amp; Save Video</title>
+<style>
+  :root { color-scheme: light dark; --bg:#f3f5f2; --fg:#16201a; --mut:#5d6b62; --line:#c9d2cc; --acc:#1f6b4a; --accfg:#fff; --err:#b3261e; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#121815; --fg:#e6ece8; --mut:#93a39a; --line:#2c3832; --acc:#56c596; --accfg:#08140e; --err:#ff8a80; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 Georgia, "Times New Roman", serif; }
+  main { max-width: 960px; margin: 0 auto; padding: 32px 20px 56px; }
+  h1 { font-size: 1.9rem; margin: 0 0 4px; letter-spacing: -.01em; }
+  p.sub { margin: 0 0 24px; color: var(--mut); }
+  .row { display:flex; gap:10px 14px; flex-wrap:wrap; align-items:center; }
+  .row + .row { margin-top:12px; }
+  input[type=url] { flex:1 1 280px; padding:12px 14px; font:inherit; color:inherit; background:transparent; border:1px solid var(--line); border-radius:6px; }
+  input[type=number] { width:72px; padding:8px 10px; font:inherit; color:inherit; background:transparent; border:1px solid var(--line); border-radius:6px; }
+  button { padding:12px 18px; font:inherit; border-radius:6px; border:1px solid var(--acc); background:var(--acc); color:var(--accfg); cursor:pointer; }
+  button.ghost { background:transparent; color:var(--fg); border-color:var(--line); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  :focus-visible { outline:2px solid var(--acc); outline-offset:2px; }
+  video { width:100%; margin-top:20px; background:#000; border-radius:6px; aspect-ratio:16/9; }
+  #stage { display:none; width:100%; margin-top:20px; background:#000; aspect-ratio:16/9; }
+  #stage iframe { width:100%; height:100%; border:0; display:block; }
+  #stage.lock, #stage.lock iframe { cursor:none; pointer-events:none; }
+  .embedOnly { display:none !important; }
+  .embed .embedOnly { display:inline-flex !important; align-items:center; gap:6px; }
+  .embed button.embedOnly { display:inline-block !important; }
+  .embed #stage { display:block; }
+  .embed video { display:none; }
+  .bar { height:6px; margin-top:14px; background:var(--line); border-radius:3px; overflow:hidden; }
+  .bar > i { display:block; height:100%; width:0; background:var(--acc); }
+  #status { margin-top:10px; min-height:1.5em; color:var(--mut); }
+  #status.err { color:var(--err); }
+  small { display:block; margin-top:28px; color:var(--mut); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Play &amp; Save Video</h1>
+  <p class="sub">Paste a video link. It plays here and is recorded. You can pause, stop and download the result at any time.</p>
+
+  <div class="row">
+    <input id="url" type="url" placeholder="https://example.com/video.mp4 or an embed link" aria-label="Video URL">
+    <button id="start">Start</button>
+  </div>
+
+  <video id="v" controls playsinline crossorigin="anonymous"></video>
+  <div id="stage"><iframe id="frame" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen title="Embedded player"></iframe></div>
+
+  <div class="row">
+    <button id="rec" class="embedOnly">Record player</button>
+    <button id="vpause" class="ghost" disabled>Pause video</button>
+    <button id="rpause" class="ghost" disabled>Pause recording</button>
+    <button id="stop" class="ghost" disabled>Stop recording</button>
+    <button id="dl" disabled>Download final recording</button>
+  </div>
+  <div class="row">
+    <label><input id="auto" type="checkbox" checked> Download automatically when finished</label>
+    <label class="embedOnly"><input id="hide" type="checkbox" checked> Hide mouse and hover controls</label>
+    <label class="embedOnly"><input id="stall" type="checkbox" checked> Pause recording when video freezes</label>
+    <label class="embedOnly">Fallback stop after <input id="idle" type="number" min="0" step="1" value="8"> s still</label>
+    <label class="embedOnly">Max length <input id="mins" type="number" min="1" step="1" placeholder="min"> min</label>
+  </div>
+
+  <div class="bar" aria-hidden="true"><i id="fill"></i></div>
+  <div id="status" role="status"></div>
+
+  <small>Direct video files (.mp4, .webm, .ogg) are recorded automatically. For embed or page links, click <b>Record player</b>, choose <b>This tab</b> and tick <b>Share tab audio</b>; only the player area is recorded (Chrome or Edge). If the network drops or the video freezes or is paused, the recording pauses by itself and continues when playback returns. <b>Pause recording</b> holds it until you resume. <b>Stop recording</b> ends it, and <b>Download final recording</b> saves the finished file, also after an early stop. Use the Pause video button here rather than the player’s own controls so the page always knows the state. Protected (DRM) video records as a black screen. Only save videos you have the right to keep.</small>
+</main>
+
+<script>
+(function () {
+  const $ = id => document.getElementById(id);
+  const urlIn = $('url'), startB = $('start'), stopB = $('stop'), recB = $('rec');
+  const vpauseB = $('vpause'), rpauseB = $('rpause'), dlB = $('dl');
+  const autoB = $('auto'), hideB = $('hide'), stallB = $('stall'), idleIn = $('idle'), minsIn = $('mins');
+  const v = $('v'), stage = $('stage'), frame = $('frame'), fill = $('fill'), statusEl = $('status');
+
+  let recorder = null, chunks = [], maxTimer = null, watch = null, displayStream = null, actx = null;
+  let armed = false, waitClick = false, manualHold = false;
+  let finalBlob = null, finalName = 'video-saved.webm';
+  let pj = newPj();
+
+  function newPj() { return { ready: false, paused: false, hasTime: false, tick: 0, sec: 0, dur: 0 }; }
+  const isEmbed = () => document.body.classList.contains('embed');
+  const vPaused = () => isEmbed() ? pj.paused : v.paused;
+  function say(msg, isErr) { statusEl.textContent = msg; statusEl.className = isErr ? 'err' : ''; }
+
+  function ui() {
+    const rec = !!recorder, paused = rec && recorder.state === 'paused';
+    startB.disabled = rec; recB.disabled = rec;
+    rpauseB.disabled = !rec; rpauseB.textContent = paused ? 'Resume recording' : 'Pause recording';
+    stopB.disabled = !rec;
+    vpauseB.disabled = !(isEmbed() || v.getAttribute('src'));
+    vpauseB.textContent = vPaused() ? 'Play video' : 'Pause video';
+    dlB.disabled = !finalBlob;
+  }
+
+  function pickType() {
+    const list = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'];
+    return list.find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || '';
+  }
+
+  function fileName(mime) {
+    let base = 'video';
+    try { base = decodeURIComponent(new URL(urlIn.value).pathname.split('/').filter(Boolean).pop() || 'video').replace(/\.[^.]+$/, '') || 'video'; } catch (e) {}
+    return base + '-saved.' + (mime.includes('mp4') ? 'mp4' : 'webm');
+  }
+
+  function cleanup() {
+    clearTimeout(maxTimer); maxTimer = null;
+    clearInterval(watch); watch = null;
+    if (actx) { actx.close().catch(() => {}); actx = null; }
+    if (displayStream) { displayStream.getTracks().forEach(t => t.stop()); displayStream = null; }
+    stage.classList.remove('lock');
+    recorder = null; chunks = []; armed = false; waitClick = false; manualHold = false;
+    ui();
+  }
+
+  function download() {
+    if (!finalBlob) return;
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(finalBlob);
+    a.download = finalName;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  }
+
+  /* ---------- Recorder control ---------- */
+  function finish() { if (recorder && recorder.state !== 'inactive') recorder.stop(); }
+
+  function pauseRec(reason, manual) {
+    if (!recorder) return;
+    if (manual) manualHold = true;
+    if (recorder.state !== 'recording') return;
+    recorder.pause();
+    say('Recording paused: ' + reason + '.');
+    ui();
+  }
+
+  function resumeRec(auto) {
+    if (!recorder || recorder.state !== 'paused') return;
+    if (auto && manualHold) return;
+    manualHold = false;
+    recorder.resume();
+    say('Recording resumed.');
+    ui();
+  }
+
+  function startRecorder(stream) {
+    const mime = pickType();
+    try { recorder = new MediaRecorder(stream, Object.assign({ videoBitsPerSecond: 6000000 }, mime ? { mimeType: mime } : {})); }
+    catch (e) { say('Recording could not start: ' + e.message, true); cleanup(); return; }
+    chunks = []; manualHold = false;
+    const rec = recorder;
+    rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+    rec.onstop = () => {
+      if (!chunks.length) { say('Nothing was recorded.', true); cleanup(); return; }
+      const type = rec.mimeType || mime || 'video/webm';
+      finalBlob = new Blob(chunks, { type });
+      finalName = fileName(type);
+      const mb = (finalBlob.size / 1048576).toFixed(1);
+      cleanup();
+      say('Recording finished (' + mb + ' MB). ' + (autoB.checked ? 'Downloaded to your downloads folder. ' : '') + 'Use “Download final recording” to save it again.');
+      if (autoB.checked) download();
+    };
+    rec.start(1000);
+    ui();
+  }
+
+  /* ---------- Direct file mode ---------- */
+  function beginVideoRecording() {
+    const capture = v.captureStream || v.mozCaptureStream;
+    if (!capture) { say('This browser cannot capture playback. Use Chrome, Edge or Firefox.', true); return; }
+    startRecorder(capture.call(v));
+    if (recorder) say('Recording while the video plays…');
+  }
+
+  /* ---------- Embed mode ---------- */
+  function pjSend(method, value) {
+    try { frame.contentWindow.postMessage(JSON.stringify({ context: 'player.js', version: '0.0.11', method: method, value: value }), '*'); } catch (e) {}
+  }
+  function pjListen() { ['play', 'pause', 'ended', 'timeupdate'].forEach(ev => pjSend('addEventListener', ev)); }
+
+  window.addEventListener('message', e => {
+    if (e.source !== frame.contentWindow) return;
+    let d = e.data;
+    if (typeof d === 'string') { try { d = JSON.parse(d); } catch (err) { return; } }
+    if (!d || d.context !== 'player.js') return;
+    if (d.event === 'ready') { pj.ready = true; pjListen(); }
+    else if (d.event === 'play') { pj.paused = false; armed = true; pj.tick = performance.now(); resumeRec(true); ui(); }
+    else if (d.event === 'pause') { pj.paused = true; pauseRec('video paused'); ui(); }
+    else if (d.event === 'ended' && recorder) { say('Video ended. Saving…'); setTimeout(finish, 600); }
+    else if (d.event === 'timeupdate' && d.value && d.value.duration) {
+      if (d.value.seconds !== pj.sec || !pj.hasTime) pj.tick = performance.now();
+      pj.sec = d.value.seconds; pj.dur = d.value.duration; pj.hasTime = true;
+      fill.style.width = (pj.sec / pj.dur * 100) + '%';
+    }
+  });
+  frame.addEventListener('load', pjListen);
+
+  window.addEventListener('blur', () => {
+    if (recorder && waitClick && document.activeElement === frame) {
+      waitClick = false;
+      setTimeout(() => { if (hideB.checked && recorder) stage.classList.add('lock'); }, 800);
+    }
+  });
+
+  function useEmbed(u, reason) {
+    v.pause(); v.removeAttribute('src'); v.load();
+    pj = newPj();
+    document.body.classList.add('embed');
+    frame.src = u;
+    ui();
+    say((reason ? reason + ' ' : '') + 'Click “Record player”, choose This tab, and tick Share tab audio.');
+  }
+
+  async function cropToStage(track) {
+    if (!(window.CropTarget && track.cropTo)) return false;
+    try { await track.cropTo(await CropTarget.fromElement(stage)); return true; } catch (e) { return false; }
+  }
+
+  /* Watches the recorded picture and sound; pauses the recording on a freeze, resumes on motion */
+  function startWatch(stream) {
+    const idleLimit = () => parseFloat(idleIn.value) || 0;
+    const mon = document.createElement('video');
+    mon.muted = true; mon.playsInline = true;
+    mon.srcObject = new MediaStream([stream.getVideoTracks()[0]]);
+    mon.play().catch(() => {});
+    const W = 48, H = 27, cv = document.createElement('canvas');
+    cv.width = W; cv.height = H;
+    const cx = cv.getContext('2d', { willReadFrequently: true });
+    let prev = null, still = 0, an = null, buf = null;
+    const at = stream.getAudioTracks();
+    if (at.length && actx) {
+      actx.resume().catch(() => {});
+      an = actx.createAnalyser(); an.fftSize = 1024; buf = new Float32Array(an.fftSize);
+      actx.createMediaStreamSource(new MediaStream([at[0]])).connect(an);
+    }
+    watch = setInterval(() => {
+      let moved = false, loud = false;
+      try {
+        cx.drawImage(mon, 0, 0, W, H);
+        const d = cx.getImageData(0, 0, W, H).data;
+        if (prev) {
+          let s = 0;
+          for (let i = 0; i < d.length; i += 4) s += Math.abs(d[i] - prev[i]) + Math.abs(d[i + 1] - prev[i + 1]) + Math.abs(d[i + 2] - prev[i + 2]);
+          moved = s / (W * H * 3) > 1.2;
+        }
+        prev = d;
+      } catch (e) {}
+      if (an) {
+        an.getFloatTimeDomainData(buf);
+        let s = 0; for (let i = 0; i < buf.length; i++) s += buf[i] * buf[i];
+        loud = Math.sqrt(s / buf.length) > 0.004;
+      }
+      /* With player time signals use them; otherwise use picture and sound */
+      const alive = pj.hasTime ? (!pj.paused && performance.now() - pj.tick < 1500) : (moved || loud);
+      if (alive) {
+        armed = true; still = 0;
+        if (!pj.paused) resumeRec(true);
+      } else {
+        still += 0.5;
+        if (armed && !pj.paused) {
+          if (stallB.checked && still >= 1.5) pauseRec(navigator.onLine ? 'video frozen' : 'network lost');
+          if (pj.hasTime) { if (still >= 3 && pj.dur && pj.sec >= pj.dur - 1) { say('Video ended. Saving…'); finish(); } }
+          else if (navigator.onLine && idleLimit() > 0 && still >= idleLimit()) { say('Video ended. Saving…'); finish(); }
+        }
+      }
+    }, 500);
+  }
+
+  async function recordTab() {
+    if (recorder) return;
+    recB.disabled = true;
+    try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+    stage.scrollIntoView({ block: 'center' });
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { cursor: hideB.checked ? 'never' : 'always', frameRate: 30 },
+        audio: true, preferCurrentTab: true, selfBrowserSurface: 'include'
+      });
+    } catch (e) { say('Capture was cancelled or blocked: ' + e.message, true); cleanup(); return; }
+    displayStream = stream;
+    const vt = stream.getVideoTracks()[0];
+    const cropped = await cropToStage(vt);
+    vt.addEventListener('ended', finish);
+    finalBlob = null;
+    startRecorder(stream);
+    if (!recorder) return;
+    armed = false; pj.paused = false; pj.tick = performance.now();
+    startWatch(stream);
+    const m = parseFloat(minsIn.value);
+    if (m > 0) maxTimer = setTimeout(finish, m * 60000);
+
+    const note = (cropped ? '' : ' Could not crop to the player, so the whole shared area is recorded (choose “This tab” in Chrome or Edge to crop).')
+               + (stream.getAudioTracks().length ? '' : ' No audio shared: tick Share tab audio next time.');
+    if (pj.ready) {
+      pjSend('setCurrentTime', 0); pjSend('play');
+      if (hideB.checked) stage.classList.add('lock');
+      say('Recording the player. Playing automatically; it stops when the video ends.' + note);
+      setTimeout(() => {
+        if (recorder && !armed) {
+          stage.classList.remove('lock'); waitClick = true;
+          say('The player did not start by itself. Press play in the player.' + note);
+        }
+      }, 4000);
+    } else {
+      waitClick = true;
+      say('Recording the player. Press play in the player; it stops when the video ends.' + note);
+    }
+    ui();
+  }
+
+  /* ---------- Wiring ---------- */
+  startB.addEventListener('click', () => {
+    const u = urlIn.value.trim();
+    if (!/^https?:\/\//i.test(u)) { say('Paste a full link starting with http:// or https://', true); return; }
+    cleanup(); finalBlob = null; fill.style.width = '0';
+    document.body.classList.remove('embed'); frame.removeAttribute('src');
+    const looksDirect = /\.(mp4|webm|ogv|ogg|mov|m4v)(\?|#|$)/i.test(u);
+    if (!looksDirect) { useEmbed(u, 'This looks like a player page, not a video file.'); return; }
+    say('Loading video…');
+    v.src = u; v.currentTime = 0; v.load();
+    v.play().catch(() => {});
+    ui();
+  });
+
+  recB.addEventListener('click', recordTab);
+  dlB.addEventListener('click', download);
+
+  stopB.addEventListener('click', () => {
+    if (isEmbed()) { pjSend('pause'); } else { v.pause(); }
+    finish();
+  });
+
+  rpauseB.addEventListener('click', () => {
+    if (!recorder) return;
+    if (recorder.state === 'paused') resumeRec(false); else pauseRec('paused by you', true);
+  });
+
+  vpauseB.addEventListener('click', () => {
+    if (isEmbed()) {
+      if (!pj.ready) {
+        stage.classList.remove('lock'); waitClick = false;
+        say('This player cannot be controlled from here. Click pause or play inside the player.', true);
+        return;
+      }
+      if (pj.paused) { pjSend('play'); pj.paused = false; }
+      else { pjSend('pause'); pj.paused = true; pauseRec('video paused'); }
+    } else {
+      if (v.paused) v.play().catch(() => {}); else v.pause();
+    }
+    ui();
+  });
+
+  v.addEventListener('playing', () => { if (!recorder) beginVideoRecording(); else resumeRec(true); ui(); });
+  v.addEventListener('waiting', () => pauseRec(navigator.onLine ? 'video is buffering' : 'network lost'));
+  v.addEventListener('pause', () => { if (!v.ended) pauseRec('video paused'); ui(); });
+  v.addEventListener('play', ui);
+  v.addEventListener('ended', finish);
+  v.addEventListener('timeupdate', () => { if (v.duration) fill.style.width = (v.currentTime / v.duration * 100) + '%'; });
+  v.addEventListener('error', () => {
+    if (!v.getAttribute('src') || isEmbed()) return;
+    if (recorder && recorder.state !== 'inactive') { recorder.stop(); return; }
+    useEmbed(urlIn.value.trim(), 'The file could not be read directly (blocked by CORS or not a video file).');
+  });
+
+  window.addEventListener('offline', () => pauseRec('network lost'));
+  window.addEventListener('online', () => { if (recorder) say('Network is back. Recording continues when the video plays again.'); });
+
+  ui();
+})();
+</script>
+</body>
+</html>
